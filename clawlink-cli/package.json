@@ -1,0 +1,29 @@
+{
+  "name": "@useclawlink/cli",
+  "version": "0.5.4",
+  "description": "Connect Gmail, Slack, Notion, Salesforce, HubSpot, Google Workspace and 230 other apps to your AI agent \u2014 browser login, no API key to paste, no config to edit.",
+  "type": "module",
+  "bin": {
+    "clawlink": "index.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "SKILL.md",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "clawlink",
+    "mcp",
+    "integrations",
+    "oauth",
+    "agent",
+    "cli",
+    "tools"
+  ],
+  "author": "ClawLink <hello@claw-link.dev>",
+  "homepage": "https://claw-link.dev",
+  "license": "MIT"
+}

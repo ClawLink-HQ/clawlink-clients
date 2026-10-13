@@ -1,0 +1,67 @@
+{
+  "name": "@useclawlink/openclaw-plugin",
+  "version": "0.3.9",
+  "description": "Connect 1,000+ apps (Gmail, Slack, GitHub, Calendar, Notion, and more) to OpenClaw via ClawLink. One skill, 39,000+ tools, managed OAuth.",
+  "type": "module",
+  "license": "AGPL-3.0",
+  "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "clawlink",
+    "openclaw",
+    "openclaw-plugin",
+    "plugin",
+    "oauth",
+    "integrations",
+    "mcp",
+    "ai-agents",
+    "agent-tools",
+    "composio-alternative",
+    "gmail",
+    "slack",
+    "notion",
+    "github",
+    "google-calendar",
+    "google-sheets",
+    "hubspot",
+    "salesforce",
+    "shopify",
+    "stripe",
+    "linkedin",
+    "jira",
+    "linear",
+    "trello",
+    "asana",
+    "airtable"
+  ],
+  "files": [
+    "index.js",
+    "openclaw.plugin.json",
+    "README.md",
+    "skills"
+  ],
+  "exports": {
+    ".": "./index.js"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.49"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.3.13",
+      "minGatewayVersion": "2026.3.13"
+    },
+    "build": {
+      "openclawVersion": "2026.4.5",
+      "pluginSdkVersion": "2026.4.5"
+    }
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "id": "clawlink-plugin",
+  "name": "ClawLink",
+  "description": "Connect 1,000+ apps (Gmail, Slack, GitHub, Calendar, Notion, and more) to OpenClaw via ClawLink. One skill, 39,000+ tools, managed OAuth. Use when the user asks to send emails, create issues, post messages, manage calendars, search documents, and more.",
+  "version": "0.3.9",
+  "author": "ClawLink <hello@claw-link.dev>",
+  "homepage": "https://claw-link.dev",
+  "license": "AGPL-3.0",
+  "docs": "https://docs.claw-link.dev/openclaw",
+  "vendor": {
+    "name": "ClawLink",
+    "firstParty": false,
+    "website": "https://claw-link.dev",
+    "npm": "https://www.npmjs.com/package/@useclawlink/openclaw-plugin"
+  },
+  "skills": [
+    "skills"
+  ],
+  "contracts": {
+    "tools": [
+      "clawlink_begin_pairing",
+      "clawlink_get_pairing_status",
+      "clawlink_start_connection",
+      "clawlink_get_connection_status",
+      "clawlink_list_integrations",
+      "clawlink_list_tools",
+      "clawlink_search_tools",
+      "clawlink_describe_tool",
+      "clawlink_preview_tool",
+      "clawlink_call_tool",
+      "clawlink_get_result"
+    ]
+  },
+  "uiHints": {
+    "apiKey": {
+      "label": "ClawLink local credential",
+      "help": "Managed automatically by browser pairing. You usually should not edit this manually. Stored locally in OpenClaw's plugin config; never sent to the assistant.",
+      "placeholder": "Managed automatically by pairing",
+      "sensitive": true
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": true,
+    "properties": {
+      "apiKey": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}
