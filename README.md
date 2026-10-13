@@ -16,9 +16,10 @@ The Hermes plugin lives in its own repository: [ClawLink-HQ/hermes-plugin](https
 
 - They talk to one host: `https://claw-link.dev`. You can point them elsewhere
   with `CLAWLINK_BASE_URL`; nothing else is contacted.
-- They hold one secret: your ClawLink API key (`cllk_live_…`). The CLI and the
-  MCP shim save it to a local file readable only by your user (`chmod 600`);
-  OpenClaw keeps it in its own plugin config.
+- They hold one secret: your ClawLink API key (`cllk_live_…`). The CLI saves it
+  to `~/.clawlink/credentials.json`, readable only by your user (`chmod 600`);
+  the MCP shim reads it from there or from `CLAWLINK_API_KEY`; OpenClaw keeps
+  it in its own plugin config.
 - They never see your Gmail, Slack or other app passwords or OAuth tokens.
   You approve access on the provider's own sign-in screen, and those tokens are
   held server-side by our OAuth provider, not on your machine and not in chat.
