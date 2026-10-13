@@ -25,5 +25,10 @@
   ],
   "author": "ClawLink <hello@claw-link.dev>",
   "homepage": "https://claw-link.dev",
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ClawLink-HQ/clawlink-clients.git",
+    "directory": "clawlink-cli"
+  }
 }
