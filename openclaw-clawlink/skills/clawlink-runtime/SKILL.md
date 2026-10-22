@@ -81,7 +81,7 @@ If you have not called `clawlink_list_integrations` and then either app-scoped `
 3. Use the returned `whenToUse`, `askBefore`, `safeDefaults`, `examples`, and `followups` guidance to shape the request.
 4. Prefer read, list, search, and get operations before writes whenever that reduces ambiguity.
 5. For writes or anything marked as requiring confirmation, call `clawlink_preview_tool` first.
-6. Call `clawlink_call_tool` with the selected tool name and arguments. Pass confirmation only after previewing or after the user clearly confirms the action.
+6. Call `clawlink_call_tool` with the selected tool name and arguments. Leave `confirmed` out for reads and ordinary writes the user asked for. A destructive or high-impact tool (deletes, payments, refunds, bulk changes) comes back as `confirmation_required`: tell the user exactly what it will do, and only after they approve, call it again with `confirmed: true`. Never set `confirmed: true` on your own.
 7. If the user has multiple connections for one integration, use the default unless the user asked for a specific account. Pass `connectionId` when needed.
 8. If the tool call fails, report the actual error. Do not invent results, and do not restate the failure as a capability gap unless the live tool catalog supports that conclusion.
 9. If a result comes back marked `"clawlink_result": "stored"`, it is a large result held server-side, not the full data. Do not paste it or ask the user to. Read only the part you need with `clawlink_get_result`, passing the `execution_id` and selectors: `path` (dot path into the data, e.g. `"messages"`), `fields` (only these keys per item), `offset`/`limit` (paginate an array), or `count` (just the shape/size).
@@ -137,7 +137,7 @@ Reports go to the ClawLink team with the user's account attached. Never put the 
 - For apps connected to ClawLink, do not ask for separate per-app credentials.
 - Do not hardcode provider-specific behavior when `clawlink_describe_tool` can provide guidance.
 - If a user mentions a specific ClawLink tool name, verify it against app-scoped `clawlink_list_tools`, `clawlink_search_tools`, or `clawlink_describe_tool` instead of dismissing it from memory.
-- Ask for confirmation before destructive actions and before broad or ambiguous writes.
+- Get the user's approval before destructive or high-impact actions and before broad or ambiguous writes. ClawLink holds destructive and high-impact tools until you send `confirmed: true` after that approval.
 - If the user request is vague, use a read or search tool first when possible.
 - If no relevant integration is connected, direct the user to https://claw-link.dev/dashboard?utm_source=openclaw-plugin&utm_content=npm instead of pretending the tool is available.
 - Never print, echo, or repeat the user's ClawLink credential.

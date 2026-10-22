@@ -36,7 +36,7 @@ piped. Run `npx -y @useclawlink/cli <command> --help` for a command's flags.
   (`tiktok-data`, `instagram-data`, `x-data`, `youtube-data`, `linkedin-data`,
   `reddit-data`, `threads-data` and more), shopping (`amazon-data`,
   `walmart-data`, `ebay-data`), music (`spotify-data`, `apple-music-data`),
-  maps (`apple-maps-data`), SEO (`seo-keyword-data`, `seo-domain-data`,
+  maps (`google-maps-data`, `apple-maps-data`), Google News/Shopping/Images/Scholar/Patents/Trends (`google-search-data`), jobs on Indeed, Glassdoor and remote boards (`jobs-data`), PDF and OCR (`pdf-data`), SEO (`seo-keyword-data`, `seo-domain-data`,
   `ai-visibility-data`) and markets (`crypto-market-data`, `stock-market-data`). Each call costs a few cents of ClawLink credit; the action's
   description shows the price. Do not loop over them without telling the user.
 - To report a bug in ClawLink itself:

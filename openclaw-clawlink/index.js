@@ -7,7 +7,7 @@ import { Type } from "@sinclair/typebox";
 const PLUGIN_ID = "clawlink-plugin";
 const LEGACY_PLUGIN_IDS = ["clawlink", "openclaw-plugin"];
 const DEFAULT_BASE_URL = "https://claw-link.dev";
-const USER_AGENT = "@useclawlink/openclaw-plugin/0.3.9";
+const USER_AGENT = "@useclawlink/openclaw-plugin/0.3.11";
 const DEFAULT_PAIRING_POLL_INTERVAL_MS = 3000;
 // Config this plugin wrote that OpenClaw's snapshot may not show yet. loadConfig() returns a
 // pinned snapshot, and on OpenClaw 2026.9 the reload after our write often fails ("still has
@@ -72,7 +72,8 @@ function getPluginConfigEntry(entries, pluginId) {
 }
 
 function getDynamicPluginConfig(api) {
-  const liveConfig = api.runtime?.config?.loadConfig?.();
+  // loadConfig() until 2026.8.x; current() since (loadConfig is gone in 2026.10.x).
+  const liveConfig = api.runtime?.config?.loadConfig?.() ?? api.runtime?.config?.current?.();
   const entries = liveConfig?.plugins?.entries;
 
   for (const pluginId of [api.id, ...LEGACY_PLUGIN_IDS]) {
@@ -858,6 +859,28 @@ function collectToolArguments(params, reservedKeys) {
 async function persistPluginConfig(api, mutateConfig) {
   const runtimeConfig = api.runtime?.config;
 
+  // OpenClaw 2026.10.x: the only write path. `config-runtime` (the fallback
+  // below) was removed from the plugin SDK on 2026-09-30.
+  if (typeof runtimeConfig?.mutateConfigFile === "function") {
+    let nextConfig;
+    await runtimeConfig.mutateConfigFile({
+      // The plugin already holds the new value in memory (configWrites), so the
+      // gateway needs no reload or restart for it.
+      afterWrite: { mode: "none", reason: "ClawLink plugin config is read live by the plugin" },
+      mutate: (draft) => {
+        nextConfig = mutateConfig(structuredClone(draft));
+        for (const key of Object.keys(draft)) {
+          if (!Object.hasOwn(nextConfig, key)) {
+            delete draft[key];
+          }
+        }
+        Object.assign(draft, nextConfig);
+      },
+    });
+
+    return nextConfig;
+  }
+
   if (
     typeof runtimeConfig?.loadConfig === "function" &&
     typeof runtimeConfig?.writeConfigFile === "function"
@@ -1628,7 +1651,7 @@ const clawlinkPlugin = {
 
     api.registerTool({
       name: "clawlink_call_tool",
-      description: "Run a ClawLink tool aggressively using the live tool catalog and inputSchema as your source of truth. Do not ask the user which fields to use when the schema already tells you. If ClawLink rejects the arguments, the error includes missingFields and the full inputSchema, so inspect that payload and retry with corrected fields.",
+      description: "Run a ClawLink tool. Use the live tool catalog and inputSchema to fill the arguments; do not ask the user for fields the schema already explains. Reads and ordinary writes the user asked for run directly. A tool that can delete data or make a high-impact change (for example a payment, refund or bulk delete) is held until the user approves it: describe the change, ask the user, and only after they agree call again with confirmed: true. If ClawLink rejects the arguments, the error includes missingFields and the full inputSchema, so fix the fields and retry.",
       parameters: Type.Object({
         tool: Type.String({
           description: "ClawLink tool name, for example notion_retrieve_page or googlecalendar_events_list.",
@@ -1642,7 +1665,7 @@ const clawlinkPlugin = {
           minimum: 1,
         })),
         confirmed: Type.Optional(Type.Boolean({
-          description: "Defaults to true. Pass false only when you want ClawLink to refuse a write tool that needs explicit re-confirmation; use clawlink_preview_tool for dry runs instead.",
+          description: "Set to true only after the user has approved this exact destructive or high-impact action. Leave it out for reads and ordinary writes. Use clawlink_preview_tool for a dry run.",
         })),
       }),
       async execute(_id, params) {
@@ -1656,7 +1679,10 @@ const clawlinkPlugin = {
           throw new Error("tool is required");
         }
 
-        const confirmed = params.confirmed !== false;
+        // Sent only when the agent set it: with the confirm-high-impact
+        // capability the server runs ordinary writes and holds destructive or
+        // high-impact tools until the user approves (confirmed: true).
+        const confirmation = typeof params.confirmed === "boolean" ? { confirmed: params.confirmed } : {};
 
         let files;
         try {
@@ -1677,13 +1703,13 @@ const clawlinkPlugin = {
             // Opt into result offloading: large results come back as a compact
             // stored envelope (read with clawlink_get_result) instead of flooding
             // context. Servers that predate offloading ignore this header.
-            headers: { "x-clawlink-capabilities": "offload" },
+            headers: { "x-clawlink-capabilities": "offload, confirm-high-impact" },
             body: {
               arguments: args,
               ...(Number.isInteger(params.connectionId)
                 ? { connectionId: params.connectionId }
                 : {}),
-              confirmed,
+              ...confirmation,
               ...(files.length > 0 ? { files } : {}),
             },
           },

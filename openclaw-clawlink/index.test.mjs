@@ -170,8 +170,8 @@ test("clawlink_call_tool forwards nested arguments unchanged", async () => {
     headers: {
 	      "X-ClawLink-API-Key": "cllk_test_123",
 	      "Content-Type": "application/json",
-	      "User-Agent": "@useclawlink/openclaw-plugin/0.3.9",
-              "x-clawlink-capabilities": "offload",
+	      "User-Agent": "@useclawlink/openclaw-plugin/0.3.11",
+              "x-clawlink-capabilities": "offload, confirm-high-impact",
 	    },
     body: {
       arguments: {
@@ -435,7 +435,6 @@ test("clawlink_call_tool falls back to top-level tool args", async () => {
       body: "Test body",
     },
     connectionId: 12,
-    confirmed: true,
   });
 });
 
@@ -1301,4 +1300,36 @@ test("tools keep working right after pairing while OpenClaw still serves the pre
     await command.handler({ args: "logout" });
     await assert.rejects(() => listIntegrations.execute("test", {}), /not paired yet/);
   });
+});
+
+test("pairing saves the key on OpenClaw 2026.10 (current + mutateConfigFile, no config-runtime)", async () => {
+  // 2026-10-21: OpenClaw 2026.10.5 removed `openclaw/plugin-sdk/config-runtime` and
+  // runtime.config.loadConfig/writeConfigFile, so every pairing failed with an import error.
+  const api = createFakeApi({});
+  let fileConfig = api.runtime.config.loadConfig();
+  const writes = [];
+  api.runtime.config = {
+    current: () => structuredClone(fileConfig),
+    async mutateConfigFile({ afterWrite, mutate }) {
+      assert.ok(afterWrite && afterWrite.mode, "afterWrite is required by OpenClaw");
+      const draft = structuredClone(fileConfig);
+      await mutate(draft, { attempt: 1 });
+      fileConfig = draft;
+      writes.push(afterWrite.mode);
+      return { nextConfig: draft, result: undefined };
+    },
+  };
+  clawlinkPlugin.register(api);
+
+  await withFetchMock(pairingFetchMock("pair_sess_131"), async () => {
+    await api.getTool("clawlink_begin_pairing").execute("test", {});
+    const status = await api.getTool("clawlink_get_pairing_status").execute("test", {});
+    assert.equal(status.details.session.status, "paired");
+  });
+
+  const saved = fileConfig.plugins.entries["clawlink-plugin"].config;
+  assert.equal(saved.apiKey, "cllk_test_pair_sess_131");
+  assert.equal(saved.pendingPairing, undefined);
+  assert.equal(fileConfig.plugins.entries["clawlink-plugin"].enabled, true);
+  assert.ok(writes.length >= 2);
 });

@@ -2,7 +2,7 @@
   "id": "clawlink-plugin",
   "name": "ClawLink",
   "description": "Connect 1,000+ apps (Gmail, Slack, GitHub, Calendar, Notion, and more) to OpenClaw via ClawLink. One skill, 39,000+ tools, managed OAuth. Use when the user asks to send emails, create issues, post messages, manage calendars, search documents, and more.",
-  "version": "0.3.9",
+  "version": "0.3.11",
   "author": "ClawLink <hello@claw-link.dev>",
   "homepage": "https://claw-link.dev",
   "license": "AGPL-3.0",
