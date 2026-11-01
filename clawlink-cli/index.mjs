@@ -16,7 +16,7 @@ import { mkdirSync, readFileSync, writeFileSync, rmSync, existsSync, chmodSync }
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const VERSION = "0.5.4";
+const VERSION = "0.5.5";
 const BASE_URL = (process.env.CLAWLINK_BASE_URL || "https://claw-link.dev").replace(/\/+$/, "");
 const CONFIG_DIR = join(homedir(), ".clawlink");
 const CONFIG_FILE = join(CONFIG_DIR, "credentials.json");
@@ -211,6 +211,12 @@ async function cmdLogin() {
       } catch {}
       const who = session.approvedUserHint ? ` as ${session.approvedUserHint}` : "";
       out(`\n  ✓ Logged in${who}. Credential saved to ${CONFIG_FILE}`);
+      const openclaw = linkOpenClaw(exchanged.apiKey);
+      if (openclaw === "linked") out("  ✓ OpenClaw's ClawLink plugin is paired too. Its clawlink_* tools work now, no restart needed.");
+      else if (openclaw === "unreachable") {
+        out("  ! This login is for the clawlink command only. OpenClaw's ClawLink plugin keeps its own login:");
+        out("    type /clawlink pair in OpenClaw, approve the link, then call clawlink_get_pairing_status once.");
+      }
       out("  Next: `clawlink connect <app>` (e.g. gmail), then `clawlink apps`.");
       out("  Using Claude Code, Cursor, Windsurf, or Claude Desktop? `clawlink install <client>` wires it up.");
       return;
@@ -220,6 +226,25 @@ async function cmdLogin() {
     }
   }
   throw new Error("Pairing timed out. Run `clawlink login` again.");
+}
+
+// The OpenClaw plugin never reads ~/.clawlink: it keeps its key in OpenClaw's own
+// config. So `clawlink login` run inside OpenClaw left the plugin "not paired yet"
+// and a small model looped on clawlink_begin_pairing (support, 2026-10-31). Hand the
+// same key to the plugin through OpenClaw's config writer; the gateway hot-reloads it.
+// Stdin, not argv, so the key never shows in a process list.
+function linkOpenClaw(apiKey) {
+  if (HARNESS !== "openclaw" && !existsSync(join(homedir(), ".openclaw"))) return "absent";
+  const run = (args, input) =>
+    spawnSync("openclaw", args, { input, encoding: "utf8", timeout: 30_000, shell: platform() === "win32", windowsHide: true });
+  const installed = run(["config", "get", "plugins.entries.clawlink-plugin.enabled"]);
+  // No `openclaw` on PATH (the desktop app can run without one; on Windows the shell
+  // reports that as a plain exit 1) or no plugin: inside OpenClaw, say how to pair.
+  const missed = HARNESS === "openclaw" ? "unreachable" : "absent";
+  if (installed.error || installed.status !== 0) return missed;
+  const patch = JSON.stringify({ plugins: { entries: { "clawlink-plugin": { config: { apiKey } } } } });
+  const res = run(["config", "patch", "--stdin"], patch);
+  return !res.error && res.status === 0 ? "linked" : missed;
 }
 
 function cmdLogout() {

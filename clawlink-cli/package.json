@@ -1,6 +1,6 @@
 {
   "name": "@useclawlink/cli",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "description": "Connect Gmail, Slack, Notion, Salesforce, HubSpot, Google Workspace and 230 other apps to your AI agent \u2014 browser login, no API key to paste, no config to edit.",
   "type": "module",
   "bin": {

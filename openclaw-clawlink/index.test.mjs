@@ -170,7 +170,7 @@ test("clawlink_call_tool forwards nested arguments unchanged", async () => {
     headers: {
 	      "X-ClawLink-API-Key": "cllk_test_123",
 	      "Content-Type": "application/json",
-	      "User-Agent": "@useclawlink/openclaw-plugin/0.3.11",
+	      "User-Agent": "@useclawlink/openclaw-plugin/0.3.12",
               "x-clawlink-capabilities": "offload, confirm-high-impact",
 	    },
     body: {
@@ -994,6 +994,73 @@ test("clawlink_get_pairing_status exchanges the approved session and clears pend
     (request) => request.url === "https://claw-link.dev/api/integrations",
   );
   assert.equal(integrationRequest?.headers["X-ClawLink-API-Key"], "cllk_test_paired_123");
+});
+
+test("a repeated clawlink_begin_pairing finishes a pairing the browser already approved", async () => {
+  const api = createFakeApi({});
+  clawlinkPlugin.register(api);
+  const beginPairing = api.getTool("clawlink_begin_pairing");
+  let starts = 0;
+  const session = (status) => ({
+    session: { token: "pair_sess_123", status, expiresAt: "2099-05-01T01:15:00.000Z" },
+  });
+
+  await withFetchMock(async (url) => {
+    if (url === "https://claw-link.dev/api/openclaw/pair/start") {
+      starts += 1;
+      return successResponse({
+        sessionToken: "pair_sess_123",
+        status: "awaiting_browser",
+        pairUrl: "https://claw-link.dev/openclaw/pair/pair_sess_123",
+        expiresAt: "2099-05-01T01:15:00.000Z",
+        verifier: "pair_verifier_123",
+      });
+    }
+    if (url === "https://claw-link.dev/api/openclaw/pair/sessions/pair_sess_123") return successResponse(session("ready_for_device"));
+    if (url.endsWith("/exchange")) return successResponse({ ...session("awaiting_local_save"), apiKey: "cllk_test_paired_123" });
+    if (url.endsWith("/finalize")) return successResponse(session("paired"));
+    if (url === "https://claw-link.dev/api/integrations") return successResponse({ integrations: [] });
+    throw new Error(`Unexpected fetch: ${url}`);
+  }, async () => {
+    await beginPairing.execute("test", {});
+    const second = await beginPairing.execute("test", {});
+    assert.match(second.content[0].text, /pairing completed/);
+  });
+
+  assert.equal(starts, 1);
+  assert.deepEqual(api.getPluginConfig(), { apiKey: "cllk_test_paired_123" });
+});
+
+test("a repeated clawlink_begin_pairing before approval keeps the same link and points at get_pairing_status", async () => {
+  const api = createFakeApi({});
+  clawlinkPlugin.register(api);
+  const beginPairing = api.getTool("clawlink_begin_pairing");
+  let starts = 0;
+
+  await withFetchMock(async (url) => {
+    if (url === "https://claw-link.dev/api/openclaw/pair/start") {
+      starts += 1;
+      return successResponse({
+        sessionToken: "pair_sess_123",
+        status: "awaiting_browser",
+        pairUrl: "https://claw-link.dev/openclaw/pair/pair_sess_123",
+        expiresAt: "2099-05-01T01:15:00.000Z",
+        verifier: "pair_verifier_123",
+      });
+    }
+    if (url === "https://claw-link.dev/api/openclaw/pair/sessions/pair_sess_123") {
+      return successResponse({ session: { token: "pair_sess_123", status: "awaiting_browser", expiresAt: "2099-05-01T01:15:00.000Z" } });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  }, async () => {
+    await beginPairing.execute("test", {});
+    const second = await beginPairing.execute("test", {});
+    assert.match(second.content[0].text, /Do not call clawlink_begin_pairing again/);
+    assert.equal(second.details.pairUrl, "https://claw-link.dev/openclaw/pair/pair_sess_123");
+  });
+
+  assert.equal(starts, 1);
+  assert.equal(api.getPluginConfig().apiKey, undefined);
 });
 
 test("clawlink_get_pairing_status preserves pending pairing when finalize fails", async () => {

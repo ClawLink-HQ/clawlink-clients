@@ -32,6 +32,8 @@ Install ClawLink from ClawHub, OpenClaw's plugin registry, when the user asks fo
 openclaw plugins install clawhub:clawlink-plugin
 ```
 
+If OpenClaw refuses with a note to re-run with `--accept-capabilities` (OpenClaw 2026.8 and later, when you are not in an interactive terminal), run the same command again with that flag added. Older OpenClaw versions do not know the flag, so only add it when asked.
+
 The install enables the plugin and applies to the running Gateway, so do not restart the Gateway. If `openclaw plugins list` shows `clawlink-plugin` as disabled, run `openclaw plugins enable clawlink-plugin`. The ClawLink tools become available on your next turn, not in the turn where you ran the install. So do not call them in that turn: they fail with `Unknown tool id`. End the turn and tell the user: "ClawLink is installed. Reply ok and I will give you your pairing link." On the next turn, call `clawlink_begin_pairing` (see "Not configured yet"). An `Unknown tool id` error right after install is not a broken Gateway: do not restart it.
 
 If you cannot end your turn (for example you are inside a long task or a loop that waits for messages), call the tools through the Gateway instead, from the shell. This runs the installed plugin in the same turn:
@@ -104,6 +106,8 @@ If a ClawLink tool reports that the plugin is not configured, the plugin has not
 3. Tell the user to come back to OpenClaw and send `done` after approval completes.
 4. When the user comes back, call `clawlink_get_pairing_status` to finish storing the local credential and verify the result.
 5. If the ClawLink tools are not visible after install, follow "Tool visibility issues".
+
+Do not call `clawlink_begin_pairing` again while a pairing is waiting; a second call returns the same link, or finishes the pairing if it was already approved. `npx @useclawlink/cli login` signs in the `clawlink` command only. It does not pair this plugin, so a plugin tool still says "not paired yet" after it; pair with the plugin tools below.
 
 Never do the pairing exchange yourself with `curl` or by editing `openclaw.json`: your shell output masks secrets, so a hand-written key is saved as `***` and breaks the plugin. Only the plugin tools finish pairing.
 

@@ -1,0 +1,1557 @@
+import { Type } from "@sinclair/typebox";
+
+const PLUGIN_ID = "clawlink-plugin";
+const LEGACY_PLUGIN_IDS = ["clawlink", "openclaw-plugin"];
+const DEFAULT_BASE_URL = "https://claw-link.dev";
+const USER_AGENT = "@useclawlink/openclaw-plugin/0.3.12";
+const DEFAULT_PAIRING_POLL_INTERVAL_MS = 3000;
+// Config this plugin wrote that OpenClaw's snapshot may not show yet. loadConfig() returns a
+// pinned snapshot, and on OpenClaw 2026.9 the reload after our write often fails ("still has
+// active retained work"), so a read right after pairing saw no key or no pending session
+// until a Gateway restart. The Gateway loads this module more than once (chat tools and the
+// `tools.invoke` RPC run in different copies), so the store lives on globalThis, shared by
+// all copies in the process. register() empties it: OpenClaw calls register() only when it
+// applies a new generation, whose snapshot is fresh (also after an uninstall + reinstall).
+// Fields: apiKey (string, "" = cleared), pendingPairing ({ value }, value null = cleared).
+const CONFIG_WRITES_KEY = Symbol.for("clawlink-plugin.config-writes");
+
+function configWrites() {
+  return (globalThis[CONFIG_WRITES_KEY] ??= {});
+}
+const DEFAULT_PAIRING_WAIT_TIMEOUT_MS = 5 * 60 * 1000;
+
+function safeTrim(value) {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : "";
+}
+
+function tokenizeArgs(value) {
+  const input = typeof value === "string" ? value.trim() : "";
+
+  if (!input) {
+    return [];
+  }
+
+  return Array.from(input.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g), (match) =>
+    match[1] ?? match[2] ?? match[3] ?? "",
+  );
+}
+
+function isNonEmptyString(value) {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function maskSecret(value) {
+  if (!isNonEmptyString(value)) {
+    return "(unset)";
+  }
+
+  const trimmed = value.trim();
+
+  if (trimmed.length <= 8) {
+    return `${trimmed.slice(0, 2)}***`;
+  }
+
+  return `${trimmed.slice(0, 4)}...${trimmed.slice(-4)}`;
+}
+
+function getPluginConfigEntry(entries, pluginId) {
+  const pluginEntry = entries?.[pluginId];
+
+  if (pluginEntry && typeof pluginEntry === "object") {
+    return pluginEntry.config ?? {};
+  }
+
+  return null;
+}
+
+function getDynamicPluginConfig(api) {
+  // loadConfig() until 2026.8.x; current() since (loadConfig is gone in 2026.10.x).
+  const liveConfig = api.runtime?.config?.loadConfig?.() ?? api.runtime?.config?.current?.();
+  const entries = liveConfig?.plugins?.entries;
+
+  for (const pluginId of [api.id, ...LEGACY_PLUGIN_IDS]) {
+    const config = getPluginConfigEntry(entries, pluginId);
+
+    if (config) {
+      return config;
+    }
+  }
+
+  return api.pluginConfig ?? {};
+}
+
+function readApiKey(config) {
+  const value = isNonEmptyString(config.apiKey) ? config.apiKey.trim() : "";
+  // A key copied through an agent's shell comes back masked; sending it only earns 401s.
+  return /\*\*\*|__OPENCLAW_REDACTED__/.test(value) ? "" : value;
+}
+
+function getPluginConfig(api) {
+  const rawConfig = getDynamicPluginConfig(api);
+  // This process's own last write is newer than the snapshot, including a clear.
+  const writes = configWrites();
+  const apiKey = Object.hasOwn(writes, "apiKey") ? writes.apiKey : readApiKey(rawConfig);
+  const rawPendingPairing = writes.pendingPairing
+    ? writes.pendingPairing.value
+    : rawConfig.pendingPairing;
+  const pendingPairing = isPlainObject(rawPendingPairing)
+    ? {
+        sessionToken: safeTrim(rawPendingPairing.sessionToken),
+        verifier: safeTrim(rawPendingPairing.verifier),
+        pairUrl: safeTrim(rawPendingPairing.pairUrl),
+        displayCode: safeTrim(rawPendingPairing.displayCode) || null,
+        deviceLabel: safeTrim(rawPendingPairing.deviceLabel),
+        expiresAt: safeTrim(rawPendingPairing.expiresAt),
+      }
+    : null;
+
+  const normalizedPendingPairing =
+    pendingPairing &&
+    pendingPairing.sessionToken &&
+    pendingPairing.verifier &&
+    pendingPairing.pairUrl &&
+    pendingPairing.expiresAt
+      ? pendingPairing
+      : null;
+
+  return {
+    apiKey,
+    pendingPairing: normalizedPendingPairing,
+  };
+}
+
+function requireApiKey(api) {
+  const { apiKey } = getPluginConfig(api);
+
+  if (!apiKey) {
+    throw new Error(
+      "ClawLink is not paired yet. Call clawlink_begin_pairing once and give the user the link; after they approve it, call clawlink_get_pairing_status. "
+        + "`npx @useclawlink/cli login` signs in the clawlink command only, not this plugin.",
+    );
+  }
+
+  return { apiKey };
+}
+
+async function parseJsonSafely(response) {
+  try {
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+function stringifyPayload(payload) {
+  // Compact on purpose: this string is rendered into the agent's context, and
+  // 2-space indentation measures out at 15-18% of every payload.
+  return JSON.stringify(payload);
+}
+
+function isPlainObject(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function collectErrorFields(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.filter(isNonEmptyString).map((item) => item.trim());
+}
+
+function resolveErrorSchema(payload) {
+  if (isPlainObject(payload?.inputSchema)) {
+    return payload.inputSchema;
+  }
+
+  if (isPlainObject(payload?.tool) && isPlainObject(payload.tool.inputSchema)) {
+    return payload.tool.inputSchema;
+  }
+
+  return null;
+}
+
+function formatStructuredClawLinkError(payload, status) {
+  if (payload && typeof payload.error === "string") {
+    const details =
+      Array.isArray(payload?.details) && payload.details.length > 0
+        ? `\n${payload.details.join("\n")}`
+        : "";
+    const upgradeHint =
+      typeof payload?.upgradeUrl === "string"
+        ? `\nUpgrade here: ${payload.upgradeUrl}`
+        : "";
+    return `${payload.error}${details}${upgradeHint}`;
+  }
+
+  const objectError = isPlainObject(payload?.error) ? payload.error : null;
+  const message = isNonEmptyString(objectError?.message)
+    ? objectError.message.trim()
+    : isNonEmptyString(payload?.message)
+      ? payload.message.trim()
+      : `ClawLink request failed with status ${status}`;
+  const missingFields = collectErrorFields(payload?.missingFields);
+  const invalidFields = collectErrorFields(payload?.invalidFields);
+  const details = collectErrorFields(payload?.details);
+  const hint = isNonEmptyString(payload?.hint) ? payload.hint.trim() : "";
+  const schema = resolveErrorSchema(payload);
+  const lines = [message];
+
+  if (missingFields.length > 0) {
+    lines.push(`Missing fields: ${missingFields.join(", ")}`);
+  }
+
+  if (invalidFields.length > 0) {
+    lines.push(`Invalid fields: ${invalidFields.join(", ")}`);
+  }
+
+  if (details.length > 0) {
+    lines.push(...details);
+  }
+
+  if (hint) {
+    lines.push(`Hint: ${hint}`);
+  }
+
+  if (schema) {
+    lines.push("Input schema:");
+    lines.push(stringifyPayload(schema));
+  }
+
+  if (typeof payload?.upgradeUrl === "string") {
+    lines.push(`Upgrade here: ${payload.upgradeUrl}`);
+  }
+
+  return lines.join("\n");
+}
+
+async function callClawLink(api, path, options = {}) {
+  const { apiKey } = requireApiKey(api);
+  const response = await fetch(`${DEFAULT_BASE_URL}${path}`, {
+    method: options.method ?? "GET",
+    headers: {
+      "X-ClawLink-API-Key": apiKey,
+      "Content-Type": "application/json",
+      "User-Agent": USER_AGENT,
+      ...(options.headers ?? {}),
+    },
+    body: options.body ? JSON.stringify(options.body) : undefined,
+  });
+
+  const payload = await parseJsonSafely(response);
+
+  if (!response.ok) {
+    const error = new Error(formatStructuredClawLinkError(payload, response.status));
+    error.clawlinkPayload = payload;
+    error.clawlinkStatus = response.status;
+    throw error;
+  }
+
+  return payload;
+}
+
+async function callClawLinkPublic(path, options = {}) {
+  const response = await fetch(`${DEFAULT_BASE_URL}${path}`, {
+    method: options.method ?? "GET",
+    headers: {
+      "Content-Type": "application/json",
+      "User-Agent": USER_AGENT,
+      ...(options.headers ?? {}),
+    },
+    body: options.body ? JSON.stringify(options.body) : undefined,
+  });
+
+  const payload = await parseJsonSafely(response);
+
+  if (!response.ok) {
+    const message =
+      payload && typeof payload.error === "string"
+        ? payload.error
+        : `ClawLink request failed with status ${response.status}`;
+    throw new Error(message);
+  }
+
+  return payload;
+}
+
+function textResult(text, details) {
+  return {
+    content: [
+      {
+        type: "text",
+        text,
+      },
+    ],
+    details,
+  };
+}
+
+function buildStartConnectionText(payload) {
+  if (payload?.alreadyConnected) {
+    const summary = {
+      integration: payload.integration,
+      connection: payload.connection ?? null,
+    };
+
+    return [
+      `${payload.integration} is already connected through ClawLink. No new connection needed — use clawlink_list_tools with integration "${payload.integration}" and clawlink_call_tool to act on it.`,
+      "",
+      stringifyPayload(summary),
+    ].join("\n");
+  }
+
+  const summary = {
+    integration: payload.integration,
+    sessionToken: payload.sessionToken,
+    status: payload.status,
+    displayCode: payload.displayCode,
+    connectUrl: payload.connectUrl,
+    statusUrl: payload.statusUrl,
+    expiresAt: payload.expiresAt,
+    pollIntervalMs: payload.pollIntervalMs,
+  };
+
+  return [
+    "ClawLink connection session started.",
+    "",
+    "Open the hosted setup URL, complete authentication, then poll the session token until the status changes.",
+    "",
+    stringifyPayload(summary),
+  ].join("\n");
+}
+
+function buildStatusText(payload) {
+  const summary = {
+    status: payload?.session?.status ?? null,
+    integration: payload?.session?.integration ?? null,
+    sessionToken: payload?.session?.token ?? null,
+    displayCode: payload?.session?.displayCode ?? null,
+    expiresAt: payload?.session?.expiresAt ?? null,
+    completedAt: payload?.session?.completedAt ?? null,
+    errorMessage: payload?.session?.errorMessage ?? null,
+    connection: payload?.connection ?? null,
+  };
+
+  return [
+    "ClawLink connection session status:",
+    "",
+    stringifyPayload(summary),
+  ].join("\n");
+}
+
+function summarizeIntegrations(payload) {
+  const connections = Array.isArray(payload?.integrations) ? payload.integrations : [];
+  const grouped = new Map();
+
+  for (const connection of connections) {
+    const slug = typeof connection?.integration === "string" ? connection.integration : "unknown";
+    const existing = grouped.get(slug) ?? {
+      integration: slug,
+      connectionCount: 0,
+      defaultConnectionId: null,
+      connections: [],
+    };
+
+    existing.connectionCount += 1;
+
+    if (connection?.isDefault) {
+      existing.defaultConnectionId = connection.id ?? null;
+    }
+
+    existing.connections.push({
+      id: connection?.id ?? null,
+      connectionLabel: connection?.connectionLabel ?? null,
+      accountLabel: connection?.accountLabel ?? null,
+      isDefault: Boolean(connection?.isDefault),
+      expiresAt: connection?.expiresAt ?? null,
+    });
+
+    grouped.set(slug, existing);
+  }
+
+  return Array.from(grouped.values()).sort((left, right) =>
+    left.integration.localeCompare(right.integration),
+  );
+}
+
+function buildIntegrationListText(payload) {
+  const summary = summarizeIntegrations(payload);
+
+  if (summary.length === 0) {
+    return [
+      "No connected ClawLink integrations found.",
+      "",
+      "Start a hosted connection first if the user wants to connect a new app.",
+    ].join("\n");
+  }
+
+  return [
+    "Connected ClawLink integrations:",
+    "",
+    stringifyPayload(summary),
+  ].join("\n");
+}
+
+function buildToolListText(payload) {
+  const tools = Array.isArray(payload?.tools) ? payload.tools : [];
+  const integration = isNonEmptyString(payload?.integration) ? payload.integration : null;
+  const query = isNonEmptyString(payload?.query) ? payload.query : null;
+  const heading = query
+    ? integration
+      ? `Matching ClawLink tools for ${integration} and "${query}":`
+      : `Matching ClawLink tools for "${query}":`
+    : integration
+      ? `Available ClawLink tools for ${integration}:`
+      : "Available ClawLink tools:";
+  const emptyHeading = query
+    ? integration
+      ? `No matching ClawLink tools found for ${integration} and "${query}".`
+      : `No matching ClawLink tools found for "${query}".`
+    : integration
+      ? `No ClawLink tools are currently available for ${integration}.`
+      : "No ClawLink tools are currently available.";
+
+  return [
+    tools.length > 0 ? heading : emptyHeading,
+    "",
+    "Bias toward action: use the live inputSchema in these results, pick the best matching tool, and call it. Use clawlink_describe_tool when you need more safety guidance or examples. If ClawLink rejects the arguments, read the returned missingFields and inputSchema, then retry with corrections.",
+    "",
+    stringifyPayload(
+      tools.map((tool) => ({
+        integration: tool?.integration ?? null,
+        name: tool?.name ?? null,
+        description: tool?.description ?? tool?.summary ?? null,
+        // A tool whose schema failed to hydrate server-side arrives with a stub
+        // inputSchema ({}) plus schemaHydrated:false. Rendering the bare stub
+        // reads as "this tool takes no arguments" and makes the model invent
+        // shapes — surface the state instead so it fetches the real schema.
+        inputSchema:
+          tool?.schemaHydrated === false
+            ? "NOT LOADED — call clawlink_describe_tool with this tool name to fetch the live inputSchema before executing."
+            : tool?.inputSchema ?? null,
+        mode: tool?.mode ?? null,
+        accessLevel: tool?.accessLevel ?? null,
+        risk: tool?.risk ?? null,
+        guidanceAvailable: Boolean(tool?.guidanceAvailable),
+        requiresConfirmation: Boolean(tool?.requiresConfirmation),
+        previewAvailable: Boolean(tool?.previewAvailable),
+        defaultConnectionId: tool?.defaultConnectionId ?? null,
+        connectionCount: tool?.connectionCount ?? 0,
+      })),
+    ),
+  ].join("\n");
+}
+
+function buildToolDescriptionText(payload) {
+  const summary = payload?.tool ?? payload;
+  const schemaWarning =
+    summary?.schemaHydrated === false
+      ? "Warning: this tool's live inputSchema could not be loaded right now, so the schema below may be an empty stub. Retry clawlink_describe_tool before relying on it — do not invent argument shapes from an empty schema."
+      : null;
+
+  return [
+    "ClawLink tool description:",
+    ...(schemaWarning ? ["", schemaWarning] : []),
+    "",
+    stringifyPayload(summary),
+  ].join("\n");
+}
+
+function storedResultHint(payload) {
+  const candidate = payload?.result ?? payload?.data ?? payload;
+  const envelope =
+    candidate && typeof candidate === "object" && candidate.clawlink_result === "stored"
+      ? candidate
+      : null;
+  if (!envelope) {
+    return null;
+  }
+
+  return [
+    "",
+    `This result is large and stored server-side (execution_id: ${envelope.execution_id}). Do not paste it or ask the user to.`,
+    `Read only what you need with clawlink_get_result: { executionId: "${envelope.execution_id}", path, fields, offset, limit } (or count for just the shape).`,
+  ].join("\n");
+}
+
+function buildToolExecutionText(toolName, payload) {
+  const summary = {
+    tool: payload?.tool?.name ?? toolName,
+    integration: payload?.tool?.integration ?? null,
+    connectionId: payload?.connectionId ?? null,
+    requiresConfirmation: Boolean(payload?.requiresConfirmation),
+    policyReason: payload?.policyReason ?? null,
+    args: payload?.args ?? null,
+    result: payload?.result ?? payload,
+  };
+
+  const hint = storedResultHint(payload);
+
+  return [
+    `ClawLink tool result: ${toolName}`,
+    "",
+    stringifyPayload(summary),
+    ...(hint ? [hint] : []),
+  ].join("\n");
+}
+
+function buildToolErrorText(toolName, error) {
+  const status = error?.clawlinkStatus ?? null;
+  const formatted =
+    typeof error?.message === "string" && error.message.trim()
+      ? error.message
+      : `ClawLink request failed${status ? ` with status ${status}` : ""}.`;
+  return [`ClawLink tool failed: ${toolName}`, "", formatted].join("\n");
+}
+
+async function callToolWithErrorContent(toolName, api, path, options) {
+  try {
+    const payload = await callClawLink(api, path, options);
+    return textResult(buildToolExecutionText(toolName, payload), payload);
+  } catch (error) {
+    if (error && typeof error === "object" && "clawlinkPayload" in error) {
+      return textResult(buildToolErrorText(toolName, error), error.clawlinkPayload);
+    }
+    throw error;
+  }
+}
+
+function buildPairingStartText(payload) {
+  const summary = buildPairingSummary(payload);
+
+  return [
+    "ClawLink browser pairing started.",
+    "",
+    "Open the pairing URL in your browser, sign in to ClawLink if needed, and approve this OpenClaw device. After approval, come back here and send `done` (or run /clawlink pair again) so OpenClaw can finish pairing safely.",
+    "",
+    stringifyPayload(summary),
+  ].join("\n");
+}
+
+function buildPairingSummary(payload) {
+  const session = payload?.session ?? null;
+
+  return {
+    status: session?.status ?? payload?.status ?? null,
+    sessionToken: session?.token ?? payload?.sessionToken ?? null,
+    deviceLabel: session?.deviceLabel ?? payload?.deviceLabel ?? null,
+    approvedUserHint: session?.approvedUserHint ?? null,
+    expiresAt: session?.expiresAt ?? payload?.expiresAt ?? null,
+    approvedAt: session?.approvedAt ?? null,
+    pairedAt: session?.pairedAt ?? null,
+    pairUrl: payload?.pairUrl ?? null,
+    pollIntervalMs: payload?.pollIntervalMs ?? null,
+    integrations: Array.isArray(payload?.integrations) ? payload.integrations : undefined,
+  };
+}
+
+function buildPairingPendingText(payload) {
+  return [
+    "ClawLink pairing is still waiting for browser approval.",
+    "",
+    "Keep the pairing page open and approve this device. After approval, come back here and send `done` so OpenClaw can finish pairing.",
+    "",
+    stringifyPayload(buildPairingSummary(payload)),
+  ].join("\n");
+}
+
+function buildPairingAlreadyStartedText(payload) {
+  return [
+    "ClawLink pairing is already waiting for browser approval. Give the user this pairUrl.",
+    "",
+    "Do not call clawlink_begin_pairing again. Once the user says they approved, call clawlink_get_pairing_status to finish.",
+    "",
+    stringifyPayload(buildPairingSummary(payload)),
+  ].join("\n");
+}
+
+function buildPairingProgressText(payload) {
+  return [
+    "ClawLink browser approval received.",
+    "",
+    "Go back to OpenClaw and send `done` to finish the local setup.",
+    "",
+    stringifyPayload(buildPairingSummary(payload)),
+  ].join("\n");
+}
+
+function buildPairingCompletionText(payload) {
+  return [
+    "ClawLink pairing completed.",
+    "",
+    "The local device credential is saved and ready to use.",
+    "",
+    stringifyPayload(buildPairingSummary(payload)),
+  ].join("\n");
+}
+
+function buildPairingStatusText(payload) {
+  return [
+    "ClawLink pairing status:",
+    "",
+    stringifyPayload(buildPairingSummary(payload)),
+  ].join("\n");
+}
+
+function collectToolArguments(params, reservedKeys) {
+  if (isPlainObject(params.arguments)) {
+    return params.arguments;
+  }
+
+  const fallback = {};
+
+  for (const [key, value] of Object.entries(params ?? {})) {
+    if (reservedKeys.has(key)) {
+      continue;
+    }
+
+    fallback[key] = value;
+  }
+
+  return fallback;
+}
+
+async function persistPluginConfig(api, mutateConfig) {
+  const runtimeConfig = api.runtime?.config;
+
+  // OpenClaw 2026.10.x: the only write path. `config-runtime` (the fallback
+  // below) was removed from the plugin SDK on 2026-09-30.
+  if (typeof runtimeConfig?.mutateConfigFile === "function") {
+    let nextConfig;
+    await runtimeConfig.mutateConfigFile({
+      // The plugin already holds the new value in memory (configWrites), so the
+      // gateway needs no reload or restart for it.
+      afterWrite: { mode: "none", reason: "ClawLink plugin config is read live by the plugin" },
+      mutate: (draft) => {
+        nextConfig = mutateConfig(structuredClone(draft));
+        for (const key of Object.keys(draft)) {
+          if (!Object.hasOwn(nextConfig, key)) {
+            delete draft[key];
+          }
+        }
+        Object.assign(draft, nextConfig);
+      },
+    });
+
+    return nextConfig;
+  }
+
+  if (
+    typeof runtimeConfig?.loadConfig === "function" &&
+    typeof runtimeConfig?.writeConfigFile === "function"
+  ) {
+    const currentConfig = runtimeConfig.loadConfig();
+    const nextConfig = mutateConfig(structuredClone(currentConfig));
+
+    await runtimeConfig.writeConfigFile(nextConfig);
+
+    return nextConfig;
+  }
+
+  const fallbackRuntime = await import("openclaw/plugin-sdk/config-runtime");
+
+  if (typeof fallbackRuntime.updateConfig === "function") {
+    return fallbackRuntime.updateConfig((currentConfig) =>
+      mutateConfig(structuredClone(currentConfig)),
+    );
+  }
+
+  if (
+    typeof fallbackRuntime.loadConfig === "function" &&
+    typeof fallbackRuntime.writeConfigFile === "function"
+  ) {
+    const currentConfig = fallbackRuntime.loadConfig();
+    const nextConfig = mutateConfig(structuredClone(currentConfig));
+
+    await fallbackRuntime.writeConfigFile(nextConfig);
+
+    return nextConfig;
+  }
+
+  throw new Error("OpenClaw runtime config API is unavailable.");
+}
+
+function updatePluginEntryConfig(config, updater) {
+  const currentPlugins = config.plugins ?? {};
+  const currentEntries = currentPlugins.entries ?? {};
+  const legacyEntry = LEGACY_PLUGIN_IDS.map((pluginId) => currentEntries[pluginId]).find(
+    (entry) => entry && typeof entry === "object",
+  );
+  const currentEntry = currentEntries[PLUGIN_ID] ?? legacyEntry ?? {};
+  const currentPluginConfig = currentEntry.config ?? {};
+  const nextPluginConfig = updater({ ...currentPluginConfig });
+  const nextEntries = {
+    ...currentEntries,
+    [PLUGIN_ID]: {
+      ...currentEntry,
+      enabled: true,
+      config: nextPluginConfig,
+    },
+  };
+
+  for (const legacyPluginId of LEGACY_PLUGIN_IDS) {
+    if (legacyPluginId !== PLUGIN_ID) {
+      delete nextEntries[legacyPluginId];
+    }
+  }
+
+  return {
+    ...config,
+    plugins: {
+      ...currentPlugins,
+      entries: nextEntries,
+    },
+  };
+}
+
+async function saveApiKeyToConfig(api, apiKey, options = {}) {
+  const clearPendingPairing = options.clearPendingPairing !== false;
+
+  await persistPluginConfig(api, (config) =>
+    updatePluginEntryConfig(config, (pluginConfig) => {
+      const nextPluginConfig = {
+        ...pluginConfig,
+        apiKey,
+      };
+
+      delete nextPluginConfig.baseUrl;
+
+      if (clearPendingPairing) {
+        delete nextPluginConfig.pendingPairing;
+      }
+
+      return nextPluginConfig;
+    }),
+  );
+
+  configWrites().apiKey = apiKey;
+  if (clearPendingPairing) {
+    configWrites().pendingPairing = { value: null };
+  }
+}
+
+async function clearPendingPairing(api) {
+  await persistPluginConfig(api, (config) =>
+    updatePluginEntryConfig(config, (pluginConfig) => {
+      const nextPluginConfig = { ...pluginConfig };
+      delete nextPluginConfig.pendingPairing;
+      return nextPluginConfig;
+    }),
+  );
+  configWrites().pendingPairing = { value: null };
+}
+
+async function savePendingPairing(api, pairing) {
+  await persistPluginConfig(api, (config) =>
+    updatePluginEntryConfig(config, (pluginConfig) => ({
+      ...pluginConfig,
+      pendingPairing: pairing,
+    })),
+  );
+  configWrites().pendingPairing = { value: pairing };
+}
+
+function isPendingPairingExpired(pendingPairing) {
+  if (!pendingPairing?.expiresAt) {
+    return true;
+  }
+
+  const expiresAt = Date.parse(pendingPairing.expiresAt);
+
+  return Number.isFinite(expiresAt) ? expiresAt <= Date.now() : true;
+}
+
+function normalizePairingPollIntervalMs(value) {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+    return Math.floor(value);
+  }
+
+  return DEFAULT_PAIRING_POLL_INTERVAL_MS;
+}
+
+function resolvePairingWaitTimeoutMs(pendingPairing) {
+  const expiresAt = Date.parse(pendingPairing?.expiresAt ?? "");
+
+  if (Number.isFinite(expiresAt)) {
+    return Math.max(0, Math.min(DEFAULT_PAIRING_WAIT_TIMEOUT_MS, expiresAt - Date.now()));
+  }
+
+  return DEFAULT_PAIRING_WAIT_TIMEOUT_MS;
+}
+
+function createAbortError() {
+  const error = new Error("ClawLink pairing was interrupted before completion.");
+  error.name = "AbortError";
+  return error;
+}
+
+async function waitForPairingPollDelay(ms, signal) {
+  if (ms <= 0) {
+    return;
+  }
+
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+
+    const handleAbort = () => {
+      cleanup();
+      reject(createAbortError());
+    };
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", handleAbort);
+    };
+
+    if (signal?.aborted) {
+      handleAbort();
+      return;
+    }
+
+    signal?.addEventListener("abort", handleAbort, { once: true });
+  });
+}
+
+async function exchangeAndFinalizePairing(api, pendingPairing) {
+  const exchanged = await callClawLinkPublic(
+    `/api/openclaw/pair/sessions/${encodeURIComponent(pendingPairing.sessionToken)}/exchange`,
+    {
+      method: "POST",
+      body: { verifier: pendingPairing.verifier },
+    },
+  );
+  const apiKey = safeTrim(exchanged?.apiKey);
+
+  if (!apiKey) {
+    throw new Error("ClawLink pairing did not return a local device credential.");
+  }
+
+  await saveApiKeyToConfig(api, apiKey, {
+    clearPendingPairing: false,
+  });
+
+  let finalizedSession = exchanged?.session ?? null;
+
+  try {
+    const finalized = await callClawLinkPublic(
+      `/api/openclaw/pair/sessions/${encodeURIComponent(pendingPairing.sessionToken)}/finalize`,
+      {
+        method: "POST",
+        body: { verifier: pendingPairing.verifier },
+      },
+    );
+    finalizedSession = finalized?.session ?? finalizedSession;
+    await clearPendingPairing(api);
+  } catch {
+    // Keep the pending pairing marker so the plugin can retry finalization later.
+  }
+
+  const integrationsPayload = await callClawLink(api, "/api/integrations").catch(() => ({
+    integrations: [],
+  }));
+
+  return {
+    session: finalizedSession,
+    integrations: Array.isArray(integrationsPayload?.integrations)
+      ? integrationsPayload.integrations
+      : [],
+  };
+}
+
+// A model that loses track calls clawlink_begin_pairing again instead of
+// clawlink_get_pairing_status (support, 2026-10-31: four calls in a row, pairing
+// never finished). So resuming a pending pairing checks it first and finishes it
+// when the browser already approved. Returns null while approval is still pending.
+async function finishApprovedPairing(api) {
+  try {
+    const payload = await getPairingStatus(api);
+    return getPluginConfig(api).apiKey ? payload : null;
+  } catch {
+    return null;
+  }
+}
+
+async function getPairingStatus(api) {
+  const { pendingPairing, apiKey } = getPluginConfig(api);
+
+  if (!pendingPairing) {
+    if (apiKey) {
+      const integrationsPayload = await callClawLink(api, "/api/integrations").catch(() => ({
+        integrations: [],
+      }));
+
+      return {
+        session: {
+          status: "paired",
+          token: null,
+          displayCode: null,
+          deviceLabel: null,
+          approvedUserHint: null,
+          expiresAt: null,
+          approvedAt: null,
+          pairedAt: null,
+        },
+        integrations: Array.isArray(integrationsPayload?.integrations)
+          ? integrationsPayload.integrations
+          : [],
+      };
+    }
+
+    throw new Error("No ClawLink pairing session is in progress.");
+  }
+
+  if (isPendingPairingExpired(pendingPairing)) {
+    await clearPendingPairing(api);
+    throw new Error("The pending ClawLink pairing session expired. Start a new pairing flow.");
+  }
+
+  const payload = await callClawLinkPublic(
+    `/api/openclaw/pair/sessions/${encodeURIComponent(pendingPairing.sessionToken)}`,
+  );
+  const status = safeTrim(payload?.session?.status);
+
+  if (status === "ready_for_device" || status === "awaiting_local_save") {
+    const completed = await exchangeAndFinalizePairing(api, pendingPairing);
+
+    return {
+      session: {
+        ...(completed.session ?? {}),
+      },
+      pairUrl: pendingPairing.pairUrl,
+      integrations: completed.integrations,
+    };
+  }
+
+  if (status === "expired" || status === "failed") {
+    await clearPendingPairing(api);
+  }
+
+  return {
+    ...payload,
+    pairUrl: pendingPairing.pairUrl,
+  };
+}
+
+async function waitForPairingCompletion(api, pendingPairing, options = {}) {
+  const pollIntervalMs = normalizePairingPollIntervalMs(options.pollIntervalMs);
+  const timeoutMs =
+    typeof options.timeoutMs === "number" && Number.isFinite(options.timeoutMs)
+      ? Math.max(0, Math.floor(options.timeoutMs))
+      : resolvePairingWaitTimeoutMs(pendingPairing);
+  const onUpdate = typeof options.onUpdate === "function" ? options.onUpdate : null;
+  const initialPayload = {
+    session: {
+      status: "awaiting_browser",
+      token: pendingPairing.sessionToken,
+      deviceLabel: pendingPairing.deviceLabel || "OpenClaw device",
+      approvedUserHint: null,
+      expiresAt: pendingPairing.expiresAt,
+      approvedAt: null,
+      pairedAt: null,
+    },
+    pairUrl: pendingPairing.pairUrl,
+    pollIntervalMs,
+  };
+
+  onUpdate?.(textResult(buildPairingStartText({ ...initialPayload, autoFinish: true }), initialPayload));
+
+  const deadline = Date.now() + timeoutMs;
+  let lastStatus = "awaiting_browser";
+  let lastPayload = initialPayload;
+
+  while (Date.now() <= deadline) {
+    if (options.signal?.aborted) {
+      throw createAbortError();
+    }
+
+    const payload = await getPairingStatus(api);
+    const status = safeTrim(payload?.session?.status) || "awaiting_browser";
+
+    lastPayload = payload;
+
+    if (onUpdate && status !== lastStatus) {
+      if (status === "ready_for_device" || status === "awaiting_local_save") {
+        onUpdate(textResult(buildPairingProgressText(payload), payload));
+      } else if (status === "paired") {
+        onUpdate(textResult(buildPairingCompletionText(payload), payload));
+      } else if (status === "expired" || status === "failed") {
+        onUpdate(textResult(buildPairingStatusText(payload), payload));
+      }
+    }
+
+    lastStatus = status;
+
+    if (status === "paired" || status === "expired" || status === "failed") {
+      return payload;
+    }
+
+    const remainingMs = deadline - Date.now();
+
+    if (remainingMs <= 0) {
+      break;
+    }
+
+    await waitForPairingPollDelay(Math.min(pollIntervalMs, remainingMs), options.signal);
+  }
+
+  return lastPayload;
+}
+
+function buildCommandHelp() {
+  return [
+    "ClawLink commands:",
+    "",
+    "/clawlink pair [deviceLabel]",
+    "/clawlink pair-status",
+    "/clawlink status",
+    "/clawlink logout",
+  ].join("\n");
+}
+
+const clawlinkPlugin = {
+  id: PLUGIN_ID,
+  name: "ClawLink",
+  description: "Generic ClawLink bridge for hosted connections and dynamic integration tools inside OpenClaw",
+  register(api) {
+    // A new generation: its snapshot is fresh, so earlier writes are either in it or were undone.
+    delete globalThis[CONFIG_WRITES_KEY];
+    api.registerCommand({
+      name: "clawlink",
+      description: "Configure ClawLink pairing and inspect plugin status.",
+      acceptsArgs: true,
+      handler: async (ctx) => {
+        const tokens = tokenizeArgs(ctx.args);
+        const action = (tokens[0] ?? "help").toLowerCase();
+
+        if (action === "help") {
+          return { text: buildCommandHelp() };
+        }
+
+        if (action === "status") {
+          const { apiKey, pendingPairing } = getPluginConfig(api);
+
+          return {
+            text: [
+              "ClawLink status:",
+              `- credential: ${maskSecret(apiKey)}`,
+              `- configured: ${apiKey ? "yes" : "no"}`,
+              `- pairing: ${
+                pendingPairing
+                  ? isPendingPairingExpired(pendingPairing)
+                    ? "expired"
+                    : "pending"
+                  : apiKey
+                    ? "not needed"
+                    : "idle"
+              }`,
+              ...(pendingPairing && !isPendingPairingExpired(pendingPairing)
+                ? [
+                    `- pairUrl: ${pendingPairing.pairUrl}`,
+                    `- expiresAt: ${pendingPairing.expiresAt}`,
+                  ]
+                : []),
+            ].join("\n"),
+          };
+        }
+
+        if (action === "pair") {
+          const { apiKey, pendingPairing } = getPluginConfig(api);
+
+          if (apiKey) {
+            return {
+              text: "ClawLink is already configured on this OpenClaw install. Use /clawlink logout first if you want to pair a different account.",
+            };
+          }
+
+          if (pendingPairing && !isPendingPairingExpired(pendingPairing)) {
+            const completed = await finishApprovedPairing(api);
+
+            if (completed) {
+              return { text: buildPairingCompletionText(completed) };
+            }
+
+            const stillPending = getPluginConfig(api).pendingPairing;
+
+            if (stillPending) {
+              return {
+                text: buildPairingStartText({
+                  sessionToken: stillPending.sessionToken,
+                  deviceLabel: stillPending.deviceLabel || "OpenClaw device",
+                  pairUrl: stillPending.pairUrl,
+                  expiresAt: stillPending.expiresAt,
+                  pollIntervalMs: DEFAULT_PAIRING_POLL_INTERVAL_MS,
+                }),
+              };
+            }
+          }
+
+          const deviceLabel = tokens.slice(1).join(" ").trim() || "OpenClaw device";
+          const payload = await callClawLinkPublic("/api/openclaw/pair/start", {
+            method: "POST",
+            body: { deviceLabel },
+          });
+
+          await savePendingPairing(api, {
+            sessionToken: payload.sessionToken,
+            verifier: payload.verifier,
+            pairUrl: payload.pairUrl,
+            displayCode: payload.displayCode,
+            deviceLabel: payload.deviceLabel || deviceLabel,
+            expiresAt: payload.expiresAt,
+          });
+
+          return { text: buildPairingStartText(payload) };
+        }
+
+        if (action === "pair-status") {
+          const payload = await getPairingStatus(api);
+          return { text: buildPairingStatusText(payload) };
+        }
+
+        if (action === "login") {
+          return {
+            text: "Manual credential entry is no longer supported. Use /clawlink pair to start browser pairing.",
+          };
+        }
+
+        if (action === "logout") {
+          await persistPluginConfig(api, (config) =>
+            updatePluginEntryConfig(config, (pluginConfig) => {
+              const nextPluginConfig = { ...pluginConfig };
+
+              delete nextPluginConfig.apiKey;
+              delete nextPluginConfig.baseUrl;
+              delete nextPluginConfig.pendingPairing;
+
+              return nextPluginConfig;
+            }),
+          );
+
+          configWrites().apiKey = "";
+          configWrites().pendingPairing = { value: null };
+          return { text: "ClawLink credentials removed from local OpenClaw config." };
+        }
+
+        return { text: buildCommandHelp() };
+      },
+    });
+
+    api.registerTool({
+      name: "clawlink_begin_pairing",
+      description: "Start or resume browser pairing for this OpenClaw install. Use this when ClawLink is not configured yet so the user can approve the device in a browser without manual credential entry. After the user approves in the browser and comes back saying they are done, call clawlink_get_pairing_status to finish the local setup.",
+      parameters: Type.Object({
+        deviceLabel: Type.Optional(Type.String({
+          description: "Optional friendly label for this OpenClaw device, for example Steve's MacBook.",
+          minLength: 1,
+        })),
+      }),
+      async execute(_id, params, _signal, _onUpdate) {
+        const { apiKey, pendingPairing } = getPluginConfig(api);
+
+        if (apiKey) {
+          return textResult(
+            "ClawLink is already configured on this OpenClaw install. No pairing is needed unless the user wants to switch accounts.",
+            {
+              configured: true,
+            },
+          );
+        }
+
+        if (pendingPairing && isPendingPairingExpired(pendingPairing)) {
+          await clearPendingPairing(api);
+        }
+
+        const deviceLabel = isNonEmptyString(params.deviceLabel)
+          ? params.deviceLabel.trim()
+          : "OpenClaw device";
+
+        if (pendingPairing && !isPendingPairingExpired(pendingPairing)) {
+          const completed = await finishApprovedPairing(api);
+
+          if (completed) {
+            return textResult(buildPairingCompletionText(completed), completed);
+          }
+
+          const stillPending = getPluginConfig(api).pendingPairing;
+
+          if (stillPending) {
+            const payload = {
+              status: "awaiting_browser",
+              sessionToken: stillPending.sessionToken,
+              deviceLabel: stillPending.deviceLabel || deviceLabel,
+              pairUrl: stillPending.pairUrl,
+              expiresAt: stillPending.expiresAt,
+              pollIntervalMs: DEFAULT_PAIRING_POLL_INTERVAL_MS,
+            };
+
+            return textResult(buildPairingAlreadyStartedText(payload), payload);
+          }
+        }
+
+        const payload = await callClawLinkPublic("/api/openclaw/pair/start", {
+          method: "POST",
+          body: {
+            deviceLabel,
+          },
+        });
+
+        await savePendingPairing(api, {
+          sessionToken: payload.sessionToken,
+          verifier: payload.verifier,
+          pairUrl: payload.pairUrl,
+          displayCode: payload.displayCode,
+          deviceLabel: payload.deviceLabel || deviceLabel,
+          expiresAt: payload.expiresAt,
+        });
+
+        const startPayload = {
+          ...payload,
+          pollIntervalMs: normalizePairingPollIntervalMs(payload?.pollIntervalMs),
+        };
+
+        return textResult(buildPairingStartText(startPayload), startPayload);
+      },
+    });
+
+    api.registerTool({
+      name: "clawlink_get_pairing_status",
+      description: "Check whether browser pairing has been approved yet. Use this after the user comes back from the browser and says they are done. When approval is complete, this tool exchanges the session for a locally stored ClawLink credential and finalizes pairing.",
+      parameters: Type.Object({}),
+      async execute() {
+        const payload = await getPairingStatus(api);
+        return textResult(buildPairingStatusText(payload), payload);
+      },
+    });
+
+    api.registerTool({
+      name: "clawlink_start_connection",
+      description: "Internal: check whether a ClawLink integration is already connected. Prefer `clawlink_list_integrations` for this. Do NOT use this tool to start a new connection from chat — when an integration is not connected, tell the user to open https://claw-link.dev/dashboard and connect it there. If the user already has an active connection, the response will be `alreadyConnected: true`.",
+      parameters: Type.Object({
+        integration: Type.String({
+          description: "Integration slug to connect, for example slack, github, or notion.",
+          minLength: 1,
+        }),
+        forceNew: Type.Optional(Type.Boolean({
+          description: "Set to true only if the user explicitly wants to add an additional connection alongside an existing one. Defaults to false, which reuses the existing active connection when present.",
+        })),
+      }),
+      async execute(_id, params) {
+        const integration = isNonEmptyString(params.integration) ? params.integration.trim() : "";
+
+        if (!integration) {
+          throw new Error("integration is required");
+        }
+
+        const payload = await callClawLink(api, "/api/connect/start", {
+          method: "POST",
+          body: {
+            integration,
+            reuseIfConnected: params.forceNew !== true,
+          },
+        });
+
+        return textResult(buildStartConnectionText(payload), payload);
+      },
+    });
+
+    api.registerTool({
+      name: "clawlink_get_connection_status",
+      description: "Internal: poll a hosted ClawLink connection session by token. Rarely needed — connection setup is done in the dashboard at https://claw-link.dev/dashboard, and `clawlink_list_integrations` is the right way to confirm a new connection is live.",
+      parameters: Type.Object({
+        sessionToken: Type.String({
+          description: "Session token returned by clawlink_start_connection.",
+          minLength: 1,
+        }),
+      }),
+      async execute(_id, params) {
+        const sessionToken = isNonEmptyString(params.sessionToken)
+          ? params.sessionToken.trim()
+          : "";
+
+        if (!sessionToken) {
+          throw new Error("sessionToken is required");
+        }
+
+        const payload = await callClawLink(
+          api,
+          `/api/connect/sessions/${encodeURIComponent(sessionToken)}`,
+        );
+
+        return textResult(buildStatusText(payload), payload);
+      },
+    });
+
+    api.registerTool({
+      name: "clawlink_list_integrations",
+      description: "List all external apps and services currently connected through ClawLink.",
+      parameters: Type.Object({}),
+      async execute() {
+        const payload = await callClawLink(api, "/api/integrations");
+        return textResult(buildIntegrationListText(payload), payload);
+      },
+    });
+
+    api.registerTool({
+      name: "clawlink_list_tools",
+      description: "List the live ClawLink tools for one connected integration so you can act instead of guessing. Results are name + description only; call clawlink_describe_tool for the inputSchema of the tool you pick. Long catalogs are truncated — the last entry says how many more exist and to use clawlink_search_tools. Pass the integration slug from clawlink_list_integrations.",
+      parameters: Type.Object({
+        integration: Type.String({
+          description: "Required integration slug to list only that app's tools, for example youtube, gmail, slack, notion, or github. Call clawlink_list_integrations first if you do not know the slug.",
+          minLength: 1,
+        }),
+      }),
+      async execute(_id, params) {
+        const integration = isNonEmptyString(params?.integration)
+          ? params.integration.trim().toLowerCase()
+          : "";
+
+        if (!integration) {
+          throw new Error("integration is required. Call clawlink_list_integrations first, then call clawlink_list_tools with that integration slug.");
+        }
+
+        const path = `/api/tools?${new URLSearchParams({ integration }).toString()}`;
+        const payload = await callClawLink(api, path);
+        return textResult(buildToolListText(payload), payload);
+      },
+    });
+
+    api.registerTool({
+      name: "clawlink_search_tools",
+      description: "Search the user's connected ClawLink tools by capability or keyword when you know the goal but not the exact tool name. Results include the live inputSchema for each match. Pick the best match and call it rather than asking the user to translate provider docs into arguments.",
+      parameters: Type.Object({
+        query: Type.String({
+          description: "Capability or keyword to search for, for example playlist, send email, channel statistics, create event, upload file, or list records.",
+          minLength: 1,
+        }),
+        integration: Type.Optional(Type.String({
+          description: "Optional connected integration slug to narrow results, for example youtube, gmail, slack, notion, or github.",
+          minLength: 1,
+        })),
+        limit: Type.Optional(Type.Integer({
+          description: "Maximum number of matches to return. Defaults to 10 and is capped by ClawLink.",
+          minimum: 1,
+          maximum: 25,
+        })),
+      }),
+      async execute(_id, params) {
+        const query = isNonEmptyString(params?.query) ? params.query.trim() : "";
+
+        if (!query) {
+          throw new Error("query is required");
+        }
+
+        const searchParams = new URLSearchParams({ query });
+        const integration = isNonEmptyString(params?.integration)
+          ? params.integration.trim().toLowerCase()
+          : "";
+
+        if (integration) {
+          searchParams.set("integration", integration);
+        }
+
+        if (Number.isInteger(params?.limit)) {
+          searchParams.set("limit", String(params.limit));
+        }
+
+        const payload = await callClawLink(api, `/api/tools/search?${searchParams.toString()}`);
+        return textResult(buildToolListText(payload), payload);
+      },
+    });
+
+    api.registerTool({
+      name: "clawlink_describe_tool",
+      description: "Get the live recipe card for one ClawLink tool: inputSchema, safety guidance, examples, prerequisites, and follow-up hints. Use this when a tool is unfamiliar or the call is write-like, then execute with your best guess.",
+      parameters: Type.Object({
+        tool: Type.String({
+          description: "ClawLink tool name, for example notion_retrieve_page or gmail_send_email.",
+          minLength: 1,
+        }),
+      }),
+      async execute(_id, params) {
+        const tool = isNonEmptyString(params.tool) ? params.tool.trim() : "";
+
+        if (!tool) {
+          throw new Error("tool is required");
+        }
+
+        const payload = await callClawLink(api, `/api/tools/${encodeURIComponent(tool)}`);
+        return textResult(buildToolDescriptionText(payload), payload);
+      },
+    });
+
+    api.registerTool({
+      name: "clawlink_preview_tool",
+      description: "Preview a ClawLink tool call without side effects. Use this when a write tool feels risky or the arguments are still uncertain. Preview returns the same validation shape as a real call, so you can correct fields before executing.",
+      parameters: Type.Object({
+        tool: Type.String({
+          description: "ClawLink tool name, for example googlecalendar_create_event or gmail_send_email.",
+          minLength: 1,
+        }),
+        arguments: Type.Optional(Type.Record(Type.String(), Type.Unknown(), {
+          description: "Arguments for the selected tool.",
+        })),
+        connectionId: Type.Optional(Type.Integer({
+          description: "Optional ClawLink connection id when the user has multiple connections for one integration.",
+          minimum: 1,
+        })),
+      }),
+      async execute(_id, params) {
+        const tool = isNonEmptyString(params.tool) ? params.tool.trim() : "";
+        const args = collectToolArguments(
+          params,
+          new Set(["tool", "arguments", "connectionId"]),
+        );
+
+        if (!tool) {
+          throw new Error("tool is required");
+        }
+
+        return callToolWithErrorContent(
+          tool,
+          api,
+          `/api/tools/${encodeURIComponent(tool)}/preview`,
+          {
+            method: "POST",
+            body: {
+              arguments: args,
+              ...(Number.isInteger(params.connectionId)
+                ? { connectionId: params.connectionId }
+                : {}),
+            },
+          },
+        );
+      },
+    });
+
+    api.registerTool({
+      name: "clawlink_call_tool",
+      description: "Run a ClawLink tool. Use the live tool catalog and inputSchema to fill the arguments; do not ask the user for fields the schema already explains. Reads and ordinary writes the user asked for run directly. A tool that can delete data or make a high-impact change (for example a payment, refund or bulk delete) is held until the user approves it: describe the change, ask the user, and only after they agree call again with confirmed: true. If ClawLink rejects the arguments, the error includes missingFields and the full inputSchema, so fix the fields and retry.",
+      parameters: Type.Object({
+        tool: Type.String({
+          description: "ClawLink tool name, for example notion_retrieve_page or googlecalendar_events_list.",
+          minLength: 1,
+        }),
+        arguments: Type.Optional(Type.Record(Type.String(), Type.Unknown(), {
+          description: "Arguments for the selected tool.",
+        })),
+        connectionId: Type.Optional(Type.Integer({
+          description: "Optional ClawLink connection id when the user has multiple connections for one integration.",
+          minimum: 1,
+        })),
+        confirmed: Type.Optional(Type.Boolean({
+          description: "Set to true only after the user has approved this exact destructive or high-impact action. Leave it out for reads and ordinary writes. Use clawlink_preview_tool for a dry run.",
+        })),
+      }),
+      async execute(_id, params) {
+        const tool = isNonEmptyString(params.tool) ? params.tool.trim() : "";
+        const args = collectToolArguments(
+          params,
+          new Set(["tool", "arguments", "connectionId", "confirmed"]),
+        );
+
+        if (!tool) {
+          throw new Error("tool is required");
+        }
+
+        // Sent only when the agent set it: with the confirm-high-impact
+        // capability the server runs ordinary writes and holds destructive or
+        // high-impact tools until the user approves (confirmed: true).
+        const confirmation = typeof params.confirmed === "boolean" ? { confirmed: params.confirmed } : {};
+
+        return callToolWithErrorContent(
+          tool,
+          api,
+          `/api/tools/${encodeURIComponent(tool)}/execute`,
+          {
+            method: "POST",
+            // Opt into result offloading: large results come back as a compact
+            // stored envelope (read with clawlink_get_result) instead of flooding
+            // context. Servers that predate offloading ignore this header.
+            headers: { "x-clawlink-capabilities": "offload, confirm-high-impact" },
+            body: {
+              arguments: args,
+              ...(Number.isInteger(params.connectionId)
+                ? { connectionId: params.connectionId }
+                : {}),
+              ...confirmation,
+            },
+          },
+        );
+      },
+    });
+
+    api.registerTool({
+      name: "clawlink_get_result",
+      description:
+        "Read a large stored ClawLink result in slices instead of dumping the whole thing into context. When clawlink_call_tool returns a result marked \"clawlink_result\": \"stored\", call this with its execution_id and selectors to fetch only the part you need. Never ask the user to paste large data.",
+      parameters: Type.Object({
+        executionId: Type.String({
+          description: "The execution_id from a stored ClawLink result envelope.",
+          minLength: 1,
+        }),
+        path: Type.Optional(Type.String({
+          description: "Dot path into the stored result, for example \"messages\" or \"data.items\". Omit for the whole result.",
+        })),
+        fields: Type.Optional(Type.Array(Type.String(), {
+          description: "Return only these keys from each item (when the value at path is an array) or from the object.",
+        })),
+        offset: Type.Optional(Type.Integer({
+          description: "Pagination offset when the value at path is an array.",
+          minimum: 0,
+        })),
+        limit: Type.Optional(Type.Integer({
+          description: "Pagination size when the value at path is an array. Defaults to 25, max 200.",
+          minimum: 1,
+          maximum: 200,
+        })),
+        count: Type.Optional(Type.Boolean({
+          description: "Return only the shape/size of the value at path, no data.",
+        })),
+      }),
+      async execute(_id, params) {
+        const executionId = isNonEmptyString(params.executionId) ? params.executionId.trim() : "";
+
+        if (!executionId) {
+          throw new Error("executionId is required. Pass the execution_id from a stored result envelope.");
+        }
+
+        const search = new URLSearchParams();
+        if (isNonEmptyString(params.path)) {
+          search.set("path", params.path.trim());
+        }
+        if (Array.isArray(params.fields)) {
+          const fields = params.fields.filter(isNonEmptyString).map((field) => field.trim());
+          if (fields.length > 0) {
+            search.set("fields", fields.join(","));
+          }
+        }
+        if (Number.isInteger(params.offset)) {
+          search.set("offset", String(params.offset));
+        }
+        if (Number.isInteger(params.limit)) {
+          search.set("limit", String(params.limit));
+        }
+        if (params.count === true) {
+          search.set("count", "true");
+        }
+
+        const query = search.toString();
+        const payload = await callClawLink(
+          api,
+          `/api/executions/${encodeURIComponent(executionId)}${query ? `?${query}` : ""}`,
+          { headers: { "x-clawlink-capabilities": "offload" } },
+        );
+
+        return textResult(
+          [`ClawLink stored result: ${executionId}`, "", stringifyPayload(payload)].join("\n"),
+          payload,
+        );
+      },
+    });
+  },
+};
+
+export default clawlinkPlugin;

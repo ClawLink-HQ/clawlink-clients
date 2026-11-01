@@ -7,7 +7,7 @@ import { Type } from "@sinclair/typebox";
 const PLUGIN_ID = "clawlink-plugin";
 const LEGACY_PLUGIN_IDS = ["clawlink", "openclaw-plugin"];
 const DEFAULT_BASE_URL = "https://claw-link.dev";
-const USER_AGENT = "@useclawlink/openclaw-plugin/0.3.11";
+const USER_AGENT = "@useclawlink/openclaw-plugin/0.3.12";
 const DEFAULT_PAIRING_POLL_INTERVAL_MS = 3000;
 // Config this plugin wrote that OpenClaw's snapshot may not show yet. loadConfig() returns a
 // pinned snapshot, and on OpenClaw 2026.9 the reload after our write often fails ("still has
@@ -132,7 +132,8 @@ function requireApiKey(api) {
 
   if (!apiKey) {
     throw new Error(
-      "ClawLink is not paired yet. Start browser pairing with clawlink_begin_pairing.",
+      "ClawLink is not paired yet. Call clawlink_begin_pairing once and give the user the link; after they approve it, call clawlink_get_pairing_status. "
+        + "`npx @useclawlink/cli login` signs in the clawlink command only, not this plugin.",
     );
   }
 
@@ -777,7 +778,7 @@ function buildPairingStartText(payload) {
   return [
     "ClawLink browser pairing started.",
     "",
-    "Open the pairing URL in your browser, sign in to ClawLink if needed, and approve this OpenClaw device. After approval, come back here and send `done` so OpenClaw can finish pairing safely.",
+    "Open the pairing URL in your browser, sign in to ClawLink if needed, and approve this OpenClaw device. After approval, come back here and send `done` (or run /clawlink pair again) so OpenClaw can finish pairing safely.",
     "",
     stringifyPayload(summary),
   ].join("\n");
@@ -805,6 +806,16 @@ function buildPairingPendingText(payload) {
     "ClawLink pairing is still waiting for browser approval.",
     "",
     "Keep the pairing page open and approve this device. After approval, come back here and send `done` so OpenClaw can finish pairing.",
+    "",
+    stringifyPayload(buildPairingSummary(payload)),
+  ].join("\n");
+}
+
+function buildPairingAlreadyStartedText(payload) {
+  return [
+    "ClawLink pairing is already waiting for browser approval. Give the user this pairUrl.",
+    "",
+    "Do not call clawlink_begin_pairing again. Once the user says they approved, call clawlink_get_pairing_status to finish.",
     "",
     stringifyPayload(buildPairingSummary(payload)),
   ].join("\n");
@@ -1106,6 +1117,19 @@ async function exchangeAndFinalizePairing(api, pendingPairing) {
   };
 }
 
+// A model that loses track calls clawlink_begin_pairing again instead of
+// clawlink_get_pairing_status (support, 2026-10-31: four calls in a row, pairing
+// never finished). So resuming a pending pairing checks it first and finishes it
+// when the browser already approved. Returns null while approval is still pending.
+async function finishApprovedPairing(api) {
+  try {
+    const payload = await getPairingStatus(api);
+    return getPluginConfig(api).apiKey ? payload : null;
+  } catch {
+    return null;
+  }
+}
+
 async function getPairingStatus(api) {
   const { pendingPairing, apiKey } = getPluginConfig(api);
 
@@ -1299,15 +1323,25 @@ const clawlinkPlugin = {
           }
 
           if (pendingPairing && !isPendingPairingExpired(pendingPairing)) {
-            return {
-              text: buildPairingStartText({
-                sessionToken: pendingPairing.sessionToken,
-                deviceLabel: pendingPairing.deviceLabel || "OpenClaw device",
-                pairUrl: pendingPairing.pairUrl,
-                expiresAt: pendingPairing.expiresAt,
-                pollIntervalMs: DEFAULT_PAIRING_POLL_INTERVAL_MS,
-              }),
-            };
+            const completed = await finishApprovedPairing(api);
+
+            if (completed) {
+              return { text: buildPairingCompletionText(completed) };
+            }
+
+            const stillPending = getPluginConfig(api).pendingPairing;
+
+            if (stillPending) {
+              return {
+                text: buildPairingStartText({
+                  sessionToken: stillPending.sessionToken,
+                  deviceLabel: stillPending.deviceLabel || "OpenClaw device",
+                  pairUrl: stillPending.pairUrl,
+                  expiresAt: stillPending.expiresAt,
+                  pollIntervalMs: DEFAULT_PAIRING_POLL_INTERVAL_MS,
+                }),
+              };
+            }
           }
 
           const deviceLabel = tokens.slice(1).join(" ").trim() || "OpenClaw device";
@@ -1391,16 +1425,26 @@ const clawlinkPlugin = {
           : "OpenClaw device";
 
         if (pendingPairing && !isPendingPairingExpired(pendingPairing)) {
-          const payload = {
-            status: "awaiting_browser",
-            sessionToken: pendingPairing.sessionToken,
-            deviceLabel: pendingPairing.deviceLabel || deviceLabel,
-            pairUrl: pendingPairing.pairUrl,
-            expiresAt: pendingPairing.expiresAt,
-            pollIntervalMs: DEFAULT_PAIRING_POLL_INTERVAL_MS,
-          };
+          const completed = await finishApprovedPairing(api);
 
-          return textResult(buildPairingStartText(payload), payload);
+          if (completed) {
+            return textResult(buildPairingCompletionText(completed), completed);
+          }
+
+          const stillPending = getPluginConfig(api).pendingPairing;
+
+          if (stillPending) {
+            const payload = {
+              status: "awaiting_browser",
+              sessionToken: stillPending.sessionToken,
+              deviceLabel: stillPending.deviceLabel || deviceLabel,
+              pairUrl: stillPending.pairUrl,
+              expiresAt: stillPending.expiresAt,
+              pollIntervalMs: DEFAULT_PAIRING_POLL_INTERVAL_MS,
+            };
+
+            return textResult(buildPairingAlreadyStartedText(payload), payload);
+          }
         }
 
         const payload = await callClawLinkPublic("/api/openclaw/pair/start", {
