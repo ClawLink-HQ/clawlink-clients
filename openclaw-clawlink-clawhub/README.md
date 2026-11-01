@@ -2,11 +2,11 @@
 
 ![ClawLink](https://claw-link.dev/images/logo/rounded-clawlink-small.png)
 
-Connect 1,000+ apps (Gmail, Slack, GitHub, Calendar, Notion, and more) to OpenClaw via ClawLink.
+Connect 1,000+ apps (Gmail, Slack, GitHub, Google Calendar, Notion and others) to OpenClaw via ClawLink.
 
 One skill, 39,000+ tools, managed OAuth.
 
-Use when the user asks to send emails, create issues, post messages, manage calendars, search documents, and more.
+Use when the user asks to act in an app they connected through ClawLink (for example send a Gmail email, create a GitHub issue or post in Slack), or asks to use ClawLink. Not for local files or for tools outside ClawLink.
 
 > **Not affiliated with OpenClaw.** ClawLink is an independent service. This package is published by the ClawLink team under the npm scope [`@useclawlink`](https://www.npmjs.com/package/@useclawlink/openclaw-plugin). The published tarball is the source: run `npm pack @useclawlink/openclaw-plugin` and read `package/index.js`, which is plain unminified JavaScript. License: AGPL-3.0.
 
@@ -75,7 +75,7 @@ The plugin registers eleven tools. OpenClaw's assistant discovers available inte
 
 - `clawlink_begin_pairing` — start or resume browser pairing for this OpenClaw install
 - `clawlink_get_pairing_status` — finish pairing after the user returns from the browser and says `done`
-- `clawlink_start_connection` — start a hosted OAuth/connect session for a new app
+- `clawlink_start_connection` — read-only check whether an app is connected; returns the dashboard link to connect it
 - `clawlink_get_connection_status` — poll an in-progress connect session
 - `clawlink_list_integrations` — list apps already connected
 - `clawlink_list_tools` — list callable tools for one connected app

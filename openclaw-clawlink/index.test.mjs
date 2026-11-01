@@ -170,7 +170,7 @@ test("clawlink_call_tool forwards nested arguments unchanged", async () => {
     headers: {
 	      "X-ClawLink-API-Key": "cllk_test_123",
 	      "Content-Type": "application/json",
-	      "User-Agent": "@useclawlink/openclaw-plugin/0.3.13",
+	      "User-Agent": "@useclawlink/openclaw-plugin/0.3.14",
               "x-clawlink-capabilities": "offload, confirm-high-impact",
 	    },
     body: {
@@ -994,6 +994,32 @@ test("clawlink_get_pairing_status exchanges the approved session and clears pend
     (request) => request.url === "https://claw-link.dev/api/integrations",
   );
   assert.equal(integrationRequest?.headers["X-ClawLink-API-Key"], "cllk_test_paired_123");
+});
+
+test("clawlink_start_connection only reads: it never starts a connect session", async () => {
+  const api = createFakeApi({ apiKey: "cllk_test_123" });
+  clawlinkPlugin.register(api);
+  const startConnection = api.getTool("clawlink_start_connection");
+  const methods = [];
+
+  await withFetchMock(async (url, options = {}) => {
+    methods.push(`${options.method ?? "GET"} ${url}`);
+    if (url === "https://claw-link.dev/api/integrations") {
+      return successResponse({ integrations: [{ id: 7, integration: "gmail", isDefault: true }] });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  }, async () => {
+    const connected = await startConnection.execute("test", { integration: "gmail" });
+    assert.equal(connected.details.alreadyConnected, true);
+    assert.equal(connected.details.connection.id, 7);
+
+    const missing = await startConnection.execute("test", { integration: "notion" });
+    assert.equal(missing.details.alreadyConnected, false);
+    assert.equal(missing.details.connectUrl, "https://claw-link.dev/dashboard/integrations/notion");
+    assert.match(missing.content[0].text, /dashboard\/integrations\/notion/);
+  });
+
+  assert.deepEqual(methods, ["GET https://claw-link.dev/api/integrations", "GET https://claw-link.dev/api/integrations"]);
 });
 
 test("a repeated clawlink_begin_pairing finishes a pairing the browser already approved", async () => {

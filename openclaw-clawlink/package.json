@@ -1,7 +1,7 @@
 {
   "name": "@useclawlink/openclaw-plugin",
-  "version": "0.3.13",
-  "description": "Connect 1,000+ apps (Gmail, Slack, GitHub, Calendar, Notion, and more) to OpenClaw via ClawLink. One skill, 39,000+ tools, managed OAuth.",
+  "version": "0.3.14",
+  "description": "Connect 1,000+ apps (Gmail, Slack, GitHub, Google Calendar, Notion and others) to OpenClaw via ClawLink. One skill, 39,000+ tools, managed OAuth.",
   "type": "module",
   "license": "AGPL-3.0",
   "repository": {
@@ -54,7 +54,7 @@
     ".": "./index.js"
   },
   "dependencies": {
-    "@sinclair/typebox": "^0.34.49"
+    "@sinclair/typebox": "0.34.52"
   },
   "openclaw": {
     "extensions": [

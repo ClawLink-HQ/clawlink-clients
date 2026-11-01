@@ -3,7 +3,7 @@ import { Type } from "@sinclair/typebox";
 const PLUGIN_ID = "clawlink-plugin";
 const LEGACY_PLUGIN_IDS = ["clawlink", "openclaw-plugin"];
 const DEFAULT_BASE_URL = "https://claw-link.dev";
-const USER_AGENT = "@useclawlink/openclaw-plugin/0.3.13";
+const USER_AGENT = "@useclawlink/openclaw-plugin/0.3.14";
 const DEFAULT_PAIRING_POLL_INTERVAL_MS = 3000;
 // Config this plugin wrote that OpenClaw's snapshot may not show yet. loadConfig() returns a
 // pinned snapshot, and on OpenClaw 2026.9 the reload after our write often fails ("still has
@@ -300,23 +300,10 @@ function buildStartConnectionText(payload) {
     ].join("\n");
   }
 
-  const summary = {
-    integration: payload.integration,
-    sessionToken: payload.sessionToken,
-    status: payload.status,
-    displayCode: payload.displayCode,
-    connectUrl: payload.connectUrl,
-    statusUrl: payload.statusUrl,
-    expiresAt: payload.expiresAt,
-    pollIntervalMs: payload.pollIntervalMs,
-  };
-
   return [
-    "ClawLink connection session started.",
+    `${payload.integration} is not connected yet. Ask the user to open ${payload.connectUrl} in their browser and connect it, then call clawlink_list_integrations to confirm.`,
     "",
-    "Open the hosted setup URL, complete authentication, then poll the session token until the status changes.",
-    "",
-    stringifyPayload(summary),
+    stringifyPayload({ integration: payload.integration, alreadyConnected: false, connectUrl: payload.connectUrl }),
   ].join("\n");
 }
 
@@ -1228,15 +1215,12 @@ const clawlinkPlugin = {
 
     api.registerTool({
       name: "clawlink_start_connection",
-      description: "Internal: check whether a ClawLink integration is already connected. Prefer `clawlink_list_integrations` for this. Do NOT use this tool to start a new connection from chat — when an integration is not connected, tell the user to open https://claw-link.dev/dashboard and connect it there. If the user already has an active connection, the response will be `alreadyConnected: true`.",
+      description: "Read-only: check whether an app is connected through ClawLink. When it is not, this returns the dashboard link where the user connects it in their browser; it never starts a connection itself. Prefer `clawlink_list_integrations` to see every connection.",
       parameters: Type.Object({
         integration: Type.String({
-          description: "Integration slug to connect, for example slack, github, or notion.",
+          description: "Integration slug to check, for example slack, github, or notion.",
           minLength: 1,
         }),
-        forceNew: Type.Optional(Type.Boolean({
-          description: "Set to true only if the user explicitly wants to add an additional connection alongside an existing one. Defaults to false, which reuses the existing active connection when present.",
-        })),
       }),
       async execute(_id, params) {
         const integration = isNonEmptyString(params.integration) ? params.integration.trim() : "";
@@ -1245,13 +1229,19 @@ const clawlinkPlugin = {
           throw new Error("integration is required");
         }
 
-        const payload = await callClawLink(api, "/api/connect/start", {
-          method: "POST",
-          body: {
-            integration,
-            reuseIfConnected: params.forceNew !== true,
-          },
-        });
+        // Read-only on purpose (ClawHub audit, 0.3.14): this used to POST
+        // /api/connect/start, which created a connect session behind a tool
+        // described as a check. Connecting happens in the dashboard.
+        const listed = await callClawLink(api, "/api/integrations");
+        const connections = (Array.isArray(listed?.integrations) ? listed.integrations : []).filter(
+          (entry) => entry?.integration === integration,
+        );
+        const payload = {
+          integration,
+          alreadyConnected: connections.length > 0,
+          connection: connections.find((entry) => entry?.isDefault) ?? connections[0] ?? null,
+          connectUrl: `${DEFAULT_BASE_URL}/dashboard/integrations/${encodeURIComponent(integration)}`,
+        };
 
         return textResult(buildStartConnectionText(payload), payload);
       },
