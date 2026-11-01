@@ -7,7 +7,7 @@ import { Type } from "@sinclair/typebox";
 const PLUGIN_ID = "clawlink-plugin";
 const LEGACY_PLUGIN_IDS = ["clawlink", "openclaw-plugin"];
 const DEFAULT_BASE_URL = "https://claw-link.dev";
-const USER_AGENT = "@useclawlink/openclaw-plugin/0.3.12";
+const USER_AGENT = "@useclawlink/openclaw-plugin/0.3.13";
 const DEFAULT_PAIRING_POLL_INTERVAL_MS = 3000;
 // Config this plugin wrote that OpenClaw's snapshot may not show yet. loadConfig() returns a
 // pinned snapshot, and on OpenClaw 2026.9 the reload after our write often fails ("still has
@@ -133,7 +133,7 @@ function requireApiKey(api) {
   if (!apiKey) {
     throw new Error(
       "ClawLink is not paired yet. Call clawlink_begin_pairing once and give the user the link; after they approve it, call clawlink_get_pairing_status. "
-        + "`npx @useclawlink/cli login` signs in the clawlink command only, not this plugin.",
+        + "A `clawlink login` from the ClawLink CLI signs in that command only, not this plugin.",
     );
   }
 
@@ -1695,7 +1695,7 @@ const clawlinkPlugin = {
 
     api.registerTool({
       name: "clawlink_call_tool",
-      description: "Run a ClawLink tool. Use the live tool catalog and inputSchema to fill the arguments; do not ask the user for fields the schema already explains. Reads and ordinary writes the user asked for run directly. A tool that can delete data or make a high-impact change (for example a payment, refund or bulk delete) is held until the user approves it: describe the change, ask the user, and only after they agree call again with confirmed: true. If ClawLink rejects the arguments, the error includes missingFields and the full inputSchema, so fix the fields and retry.",
+      description: "Run a ClawLink tool. Use the live tool catalog and inputSchema to fill the arguments; the user only needs to supply what the schema leaves open. Reads and ordinary writes the user asked for run directly. A tool that can delete data or make a high-impact change (for example a payment, refund or bulk delete) is held until the user approves it: describe the change, ask the user, and only after they agree call again with confirmed: true. If ClawLink rejects the arguments, the error includes missingFields and the full inputSchema, so fix the fields and retry.",
       parameters: Type.Object({
         tool: Type.String({
           description: "ClawLink tool name, for example notion_retrieve_page or googlecalendar_events_list.",
@@ -1764,7 +1764,7 @@ const clawlinkPlugin = {
     api.registerTool({
       name: "clawlink_get_result",
       description:
-        "Read a large stored ClawLink result in slices instead of dumping the whole thing into context. When clawlink_call_tool returns a result marked \"clawlink_result\": \"stored\", call this with its execution_id and selectors to fetch only the part you need. Never ask the user to paste large data.",
+        "Read a large stored ClawLink result in slices instead of dumping the whole thing into context. When clawlink_call_tool returns a result marked \"clawlink_result\": \"stored\", call this with its execution_id and selectors to fetch only the part you need. The user should not have to paste large data.",
       parameters: Type.Object({
         executionId: Type.String({
           description: "The execution_id from a stored ClawLink result envelope.",

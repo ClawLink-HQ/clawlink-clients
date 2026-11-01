@@ -49,7 +49,7 @@ Run the first for the pairing link, and the second after the user approves. The 
 
 Use this skill when the user asks you to read from or act in an external app or service, such as Notion, Gmail, Outlook, ClickUp, Google Calendar, Apollo, or OneDrive. Use it only for that request. Do not call ClawLink for requests that do not involve an external app.
 
-When the app is connected to ClawLink, use the ClawLink tools below instead of browser workarounds, and do not ask the user for separate per-app credentials.
+When the app is connected to ClawLink, use the ClawLink tools below instead of browser workarounds, and the user needs no separate per-app credentials.
 
 ## After pairing
 
@@ -107,7 +107,7 @@ If a ClawLink tool reports that the plugin is not configured, the plugin has not
 4. When the user comes back, call `clawlink_get_pairing_status` to finish storing the local credential and verify the result.
 5. If the ClawLink tools are not visible after install, follow "Tool visibility issues".
 
-Do not call `clawlink_begin_pairing` again while a pairing is waiting; a second call returns the same link, or finishes the pairing if it was already approved. `npx @useclawlink/cli login` signs in the `clawlink` command only. It does not pair this plugin, so a plugin tool still says "not paired yet" after it; pair with the plugin tools below.
+Do not call `clawlink_begin_pairing` again while a pairing is waiting; a second call returns the same link, or finishes the pairing if it was already approved. A `clawlink login` from the ClawLink CLI signs in that command only. It does not pair this plugin, so a plugin tool still says "not paired yet" after it; pair with the plugin tools below.
 
 Never do the pairing exchange yourself with `curl` or by editing `openclaw.json`: your shell output masks secrets, so a hand-written key is saved as `***` and breaks the plugin. Only the plugin tools finish pairing.
 

@@ -170,7 +170,7 @@ test("clawlink_call_tool forwards nested arguments unchanged", async () => {
     headers: {
 	      "X-ClawLink-API-Key": "cllk_test_123",
 	      "Content-Type": "application/json",
-	      "User-Agent": "@useclawlink/openclaw-plugin/0.3.12",
+	      "User-Agent": "@useclawlink/openclaw-plugin/0.3.13",
               "x-clawlink-capabilities": "offload, confirm-high-impact",
 	    },
     body: {
